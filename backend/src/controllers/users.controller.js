@@ -9,7 +9,7 @@ export const getAllUsers = async (req, res, next) => {
   try {
     const query = `
       SELECT 
-        id, name, email, phone, role, specialization, 
+        id, name, email, phone, role, 
         is_active, created_at
       FROM users
       WHERE clinic_id = $1
@@ -37,7 +37,7 @@ export const getUserById = async (req, res, next) => {
     
     const query = `
       SELECT 
-        id, name, email, phone, role, specialization, 
+        id, name, email, phone, role, 
         is_active, created_at
       FROM users
       WHERE id = $1 AND clinic_id = $2
@@ -67,7 +67,7 @@ export const getUserById = async (req, res, next) => {
  */
 export const createUser = async (req, res, next) => {
   try {
-    const { name, email, phone, role, specialization, password } = req.body;
+    const { name, email, phone, role, password } = req.body;
     
     // Validate required fields
     if (!name || !email || !password || !role) {
@@ -95,10 +95,10 @@ export const createUser = async (req, res, next) => {
     const query = `
       INSERT INTO users (
         clinic_id, name, email, phone, role, 
-        specialization, password_hash, is_active
+        password_hash, is_active
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, true)
-      RETURNING id, name, email, phone, role, specialization, is_active, created_at
+      VALUES ($1, $2, $3, $4, $5, $6, true)
+      RETURNING id, name, email, phone, role, is_active, created_at
     `;
     
     const values = [
@@ -107,7 +107,6 @@ export const createUser = async (req, res, next) => {
       email,
       phone || null,
       role,
-      specialization || null,
       hashedPassword
     ];
     
@@ -130,7 +129,7 @@ export const createUser = async (req, res, next) => {
 export const updateUser = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { name, email, phone, role, specialization } = req.body;
+    const { name, email, phone, role } = req.body;
     
     // Check if user exists and belongs to clinic
     const checkQuery = 'SELECT id FROM users WHERE id = $1 AND clinic_id = $2';
@@ -150,10 +149,9 @@ export const updateUser = async (req, res, next) => {
         name = COALESCE($1, name),
         email = COALESCE($2, email),
         phone = $3,
-        role = COALESCE($4, role),
-        specialization = $5
-      WHERE id = $6 AND clinic_id = $7
-      RETURNING id, name, email, phone, role, specialization, is_active, created_at
+        role = COALESCE($4, role)
+      WHERE id = $5 AND clinic_id = $6
+      RETURNING id, name, email, phone, role, is_active, created_at
     `;
     
     const values = [
@@ -161,7 +159,6 @@ export const updateUser = async (req, res, next) => {
       email,
       phone || null,
       role,
-      specialization || null,
       id,
       req.user.clinic_id
     ];
