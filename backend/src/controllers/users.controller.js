@@ -95,7 +95,7 @@ export const createUser = async (req, res, next) => {
     const query = `
       INSERT INTO users (
         clinic_id, name, email, phone, role, 
-        specialization, password, is_active
+        specialization, password_hash, is_active
       )
       VALUES ($1, $2, $3, $4, $5, $6, $7, true)
       RETURNING id, name, email, phone, role, specialization, is_active, created_at
