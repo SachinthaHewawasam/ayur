@@ -1,0 +1,558 @@
+import { pool, getClient } from '../config/database.js';
+
+/**
+ * Get all medicines with optional filters
+ */
+export const getAllMedicines = async (req, res) => {
+  try {
+    const { search, category, low_stock, active_only = 'true' } = req.query;
+
+    let query = `
+      SELECT
+        m.*,
+        CASE
+          WHEN m.quantity_stock <= m.minimum_stock_level THEN true
+          ELSE false
+        END as is_low_stock,
+        CASE
+          WHEN m.expiry_date < CURRENT_DATE THEN 'expired'
+          WHEN m.expiry_date < CURRENT_DATE + INTERVAL '30 days' THEN 'expiring_soon'
+          ELSE 'valid'
+        END as expiry_status
+      FROM medicines m
+      WHERE 1=1
+    `;
+
+    const params = [];
+    let paramCount = 1;
+
+    // Filter by active status
+    if (active_only === 'true') {
+      query += ` AND m.is_active = true`;
+    }
+
+    // Search filter
+    if (search) {
+      params.push(`%${search}%`);
+      query += ` AND (m.name ILIKE $${paramCount} OR m.sanskrit_name ILIKE $${paramCount} OR m.category ILIKE $${paramCount})`;
+      paramCount++;
+    }
+
+    // Category filter
+    if (category) {
+      params.push(category);
+      query += ` AND m.category = $${paramCount}`;
+      paramCount++;
+    }
+
+    // Low stock filter
+    if (low_stock === 'true') {
+      query += ` AND m.quantity_stock <= m.minimum_stock_level`;
+    }
+
+    query += ` ORDER BY m.name ASC`;
+
+    const result = await pool.query(query, params);
+
+    res.json({
+      success: true,
+      count: result.rows.length,
+      data: result.rows
+    });
+  } catch (error) {
+    console.error('Error fetching medicines:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching medicines',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Get medicine by ID with stock movement history
+ */
+export const getMedicineById = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Get medicine details
+    const medicineQuery = `
+      SELECT
+        m.*,
+        CASE
+          WHEN m.quantity_stock <= m.minimum_stock_level THEN true
+          ELSE false
+        END as is_low_stock,
+        CASE
+          WHEN m.expiry_date < CURRENT_DATE THEN 'expired'
+          WHEN m.expiry_date < CURRENT_DATE + INTERVAL '30 days' THEN 'expiring_soon'
+          ELSE 'valid'
+        END as expiry_status
+      FROM medicines m
+      WHERE m.id = $1
+    `;
+
+    // Get recent stock movements
+    const movementsQuery = `
+      SELECT
+        sm.*,
+        u.name as performed_by_name
+      FROM stock_movements sm
+      LEFT JOIN users u ON sm.performed_by = u.id
+      WHERE sm.medicine_id = $1
+      ORDER BY sm.created_at DESC
+      LIMIT 50
+    `;
+
+    const [medicineResult, movementsResult] = await Promise.all([
+      pool.query(medicineQuery, [id]),
+      pool.query(movementsQuery, [id])
+    ]);
+
+    if (medicineResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Medicine not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        ...medicineResult.rows[0],
+        stock_movements: movementsResult.rows
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching medicine:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching medicine',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Create new medicine
+ */
+export const createMedicine = async (req, res) => {
+  const client = await getClient();
+
+  try {
+    await client.query('BEGIN');
+
+    const {
+      name,
+      sanskrit_name,
+      category,
+      manufacturer,
+      batch_number,
+      manufacturing_date,
+      expiry_date,
+      quantity_stock,
+      unit,
+      minimum_stock_level,
+      price_per_unit,
+      description,
+      storage_instructions
+    } = req.body;
+
+    // Insert medicine
+    const insertQuery = `
+      INSERT INTO medicines (
+        clinic_id, name, sanskrit_name, category, manufacturer,
+        batch_number, manufacturing_date, expiry_date, quantity_stock,
+        unit, minimum_stock_level, price_per_unit, description,
+        storage_instructions
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      RETURNING *
+    `;
+
+    const values = [
+      req.user.clinic_id || 1, // Default to clinic 1 for MVP
+      name,
+      sanskrit_name || null,
+      category,
+      manufacturer || null,
+      batch_number || null,
+      manufacturing_date || null,
+      expiry_date || null,
+      quantity_stock || 0,
+      unit || 'units',
+      minimum_stock_level || 10,
+      price_per_unit || 0,
+      description || null,
+      storage_instructions || null
+    ];
+
+    const result = await client.query(insertQuery, values);
+    const medicine = result.rows[0];
+
+    // Record initial stock if quantity > 0
+    if (quantity_stock && quantity_stock > 0) {
+      const stockQuery = `
+        INSERT INTO stock_movements (
+          medicine_id, type, quantity, reason, performed_by
+        ) VALUES ($1, 'in', $2, 'Initial stock', $3)
+      `;
+      await client.query(stockQuery, [medicine.id, quantity_stock, req.user.id]);
+    }
+
+    await client.query('COMMIT');
+
+    res.status(201).json({
+      success: true,
+      message: 'Medicine added successfully',
+      data: medicine
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error creating medicine:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error creating medicine',
+      error: error.message
+    });
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Update medicine
+ */
+export const updateMedicine = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      name,
+      sanskrit_name,
+      category,
+      manufacturer,
+      batch_number,
+      manufacturing_date,
+      expiry_date,
+      unit,
+      minimum_stock_level,
+      price_per_unit,
+      description,
+      storage_instructions,
+      is_active
+    } = req.body;
+
+    const updateQuery = `
+      UPDATE medicines SET
+        name = COALESCE($1, name),
+        sanskrit_name = COALESCE($2, sanskrit_name),
+        category = COALESCE($3, category),
+        manufacturer = COALESCE($4, manufacturer),
+        batch_number = COALESCE($5, batch_number),
+        manufacturing_date = COALESCE($6, manufacturing_date),
+        expiry_date = COALESCE($7, expiry_date),
+        unit = COALESCE($8, unit),
+        minimum_stock_level = COALESCE($9, minimum_stock_level),
+        price_per_unit = COALESCE($10, price_per_unit),
+        description = COALESCE($11, description),
+        storage_instructions = COALESCE($12, storage_instructions),
+        is_active = COALESCE($13, is_active)
+      WHERE id = $14
+      RETURNING *
+    `;
+
+    const values = [
+      name,
+      sanskrit_name,
+      category,
+      manufacturer,
+      batch_number,
+      manufacturing_date,
+      expiry_date,
+      unit,
+      minimum_stock_level,
+      price_per_unit,
+      description,
+      storage_instructions,
+      is_active,
+      id
+    ];
+
+    const result = await pool.query(updateQuery, values);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Medicine not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Medicine updated successfully',
+      data: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Error updating medicine:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating medicine',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Update stock (add or remove stock)
+ */
+export const updateStock = async (req, res) => {
+  const client = await getClient();
+
+  try {
+    await client.query('BEGIN');
+
+    const { id } = req.params;
+    const { type, quantity, reason, notes } = req.body;
+
+    // Validate type
+    if (!['in', 'out', 'adjustment'].includes(type)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid stock movement type. Must be: in, out, or adjustment'
+      });
+    }
+
+    // Get current stock
+    const stockCheck = await client.query(
+      'SELECT quantity_stock, name FROM medicines WHERE id = $1',
+      [id]
+    );
+
+    if (stockCheck.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Medicine not found'
+      });
+    }
+
+    const currentStock = stockCheck.rows[0].quantity_stock;
+    const medicineName = stockCheck.rows[0].name;
+
+    // Calculate new stock
+    let newStock;
+    if (type === 'in' || (type === 'adjustment' && quantity > 0)) {
+      newStock = currentStock + quantity;
+    } else if (type === 'out' || (type === 'adjustment' && quantity < 0)) {
+      newStock = currentStock - Math.abs(quantity);
+    }
+
+    // Check for negative stock
+    if (newStock < 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient stock. Current stock: ${currentStock}, Requested: ${quantity}`
+      });
+    }
+
+    // Update medicine stock
+    await client.query(
+      'UPDATE medicines SET quantity_stock = $1 WHERE id = $2',
+      [newStock, id]
+    );
+
+    // Record stock movement
+    const movementQuery = `
+      INSERT INTO stock_movements (
+        medicine_id, type, quantity, reason, notes, performed_by
+      ) VALUES ($1, $2, $3, $4, $5, $6)
+      RETURNING *
+    `;
+
+    const movementResult = await client.query(movementQuery, [
+      id,
+      type,
+      Math.abs(quantity),
+      reason || 'Manual adjustment',
+      notes,
+      req.user.id
+    ]);
+
+    await client.query('COMMIT');
+
+    res.json({
+      success: true,
+      message: `Stock updated successfully for ${medicineName}`,
+      data: {
+        previous_stock: currentStock,
+        new_stock: newStock,
+        movement: movementResult.rows[0]
+      }
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error updating stock:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating stock',
+      error: error.message
+    });
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Get low stock alerts
+ */
+export const getLowStockAlerts = async (req, res) => {
+  try {
+    const query = `
+      SELECT
+        m.*,
+        (m.minimum_stock_level - m.quantity_stock) as shortage_quantity,
+        ROUND(((m.quantity_stock::DECIMAL / NULLIF(m.minimum_stock_level, 0)) * 100), 2) as stock_percentage
+      FROM medicines m
+      WHERE m.quantity_stock <= m.minimum_stock_level
+        AND m.is_active = true
+      ORDER BY (m.quantity_stock::DECIMAL / NULLIF(m.minimum_stock_level, 1)) ASC
+    `;
+
+    const result = await pool.query(query);
+
+    res.json({
+      success: true,
+      count: result.rows.length,
+      data: result.rows
+    });
+  } catch (error) {
+    console.error('Error fetching low stock alerts:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching low stock alerts',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Get expiring medicines
+ */
+export const getExpiringMedicines = async (req, res) => {
+  try {
+    const { days = 30 } = req.query;
+
+    const query = `
+      SELECT
+        m.*,
+        (m.expiry_date - CURRENT_DATE) as days_until_expiry
+      FROM medicines m
+      WHERE m.expiry_date IS NOT NULL
+        AND m.expiry_date <= CURRENT_DATE + $1 * INTERVAL '1 day'
+        AND m.expiry_date >= CURRENT_DATE
+        AND m.is_active = true
+        AND m.quantity_stock > 0
+      ORDER BY m.expiry_date ASC
+    `;
+
+    const result = await pool.query(query, [days]);
+
+    res.json({
+      success: true,
+      count: result.rows.length,
+      data: result.rows
+    });
+  } catch (error) {
+    console.error('Error fetching expiring medicines:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching expiring medicines',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Get inventory statistics
+ */
+export const getInventoryStats = async (req, res) => {
+  try {
+    const statsQuery = `
+      SELECT
+        COUNT(*) as total_medicines,
+        COUNT(*) FILTER (WHERE quantity_stock <= minimum_stock_level) as low_stock_count,
+        COUNT(*) FILTER (WHERE quantity_stock = 0) as out_of_stock_count,
+        COUNT(*) FILTER (WHERE expiry_date < CURRENT_DATE AND quantity_stock > 0) as expired_count,
+        COUNT(*) FILTER (WHERE expiry_date <= CURRENT_DATE + INTERVAL '30 days'
+                         AND expiry_date >= CURRENT_DATE AND quantity_stock > 0) as expiring_soon_count,
+        SUM(quantity_stock * price_per_unit) as total_inventory_value
+      FROM medicines
+      WHERE is_active = true
+    `;
+
+    const categoryQuery = `
+      SELECT
+        category,
+        COUNT(*) as count,
+        SUM(quantity_stock) as total_quantity
+      FROM medicines
+      WHERE is_active = true
+      GROUP BY category
+      ORDER BY count DESC
+    `;
+
+    const [statsResult, categoryResult] = await Promise.all([
+      pool.query(statsQuery),
+      pool.query(categoryQuery)
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        ...statsResult.rows[0],
+        categories: categoryResult.rows
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching inventory stats:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching inventory stats',
+      error: error.message
+    });
+  }
+};
+
+/**
+ * Delete medicine (soft delete)
+ */
+export const deleteMedicine = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      'UPDATE medicines SET is_active = false WHERE id = $1 RETURNING *',
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Medicine not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Medicine deactivated successfully'
+    });
+  } catch (error) {
+    console.error('Error deleting medicine:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting medicine',
+      error: error.message
+    });
+  }
+};
+

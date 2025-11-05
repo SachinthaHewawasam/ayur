@@ -1,0 +1,413 @@
+import { pool } from '../config/database.js';
+
+// Get all appointments
+export const getAppointments = async (req, res) => {
+  try {
+    const { date, status, doctor_id, patient_id, start_date, end_date } = req.query;
+    const clinicId = req.user.clinic_id;
+
+    let query = `
+      SELECT
+        a.id, a.appointment_date, a.appointment_time, a.duration_minutes,
+        a.status, a.chief_complaint, a.followup_date,
+        p.id as patient_id, p.name as patient_name, p.phone as patient_phone,
+        p.patient_code,
+        u.id as doctor_id, u.name as doctor_name,
+        a.created_at
+      FROM appointments a
+      LEFT JOIN patients p ON a.patient_id = p.id
+      LEFT JOIN users u ON a.doctor_id = u.id
+      WHERE a.clinic_id = $1
+    `;
+    const params = [clinicId];
+
+    if (date) {
+      query += ` AND a.appointment_date = $${params.length + 1}`;
+      params.push(date);
+    }
+
+    // Date range filtering for calendar view
+    if (start_date) {
+      query += ` AND a.appointment_date >= $${params.length + 1}`;
+      params.push(start_date);
+    }
+
+    if (end_date) {
+      query += ` AND a.appointment_date <= $${params.length + 1}`;
+      params.push(end_date);
+    }
+
+    if (status) {
+      query += ` AND a.status = $${params.length + 1}`;
+      params.push(status);
+    }
+
+    if (doctor_id) {
+      query += ` AND a.doctor_id = $${params.length + 1}`;
+      params.push(doctor_id);
+    }
+
+    if (patient_id) {
+      query += ` AND a.patient_id = $${params.length + 1}`;
+      params.push(patient_id);
+    }
+
+    query += ' ORDER BY a.appointment_date DESC, a.appointment_time DESC';
+
+    const result = await pool.query(query, params);
+
+    res.json({
+      appointments: result.rows
+    });
+  } catch (error) {
+    console.error('Get appointments error:', error);
+    res.status(500).json({
+      error: 'Failed to fetch appointments',
+      message: error.message
+    });
+  }
+};
+
+// Get single appointment
+export const getAppointment = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const clinicId = req.user.clinic_id;
+
+    const result = await pool.query(
+      `SELECT
+        a.*,
+        p.name as patient_name, p.phone as patient_phone, p.patient_code,
+        p.dosha_type, p.allergies, p.medical_history,
+        u.name as doctor_name
+      FROM appointments a
+      LEFT JOIN patients p ON a.patient_id = p.id
+      LEFT JOIN users u ON a.doctor_id = u.id
+      WHERE a.id = $1 AND a.clinic_id = $2`,
+      [id, clinicId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: 'Appointment not found',
+        message: 'Appointment not found or access denied'
+      });
+    }
+
+    // Get prescriptions for this appointment
+    const prescriptions = await pool.query(
+      `SELECT
+        p.id, p.dosage, p.frequency, p.duration_days,
+        p.quantity_prescribed, p.special_instructions,
+        m.id as medicine_id, m.name as medicine_name,
+        m.category, m.sanskrit_name
+      FROM prescriptions p
+      LEFT JOIN medicines m ON p.medicine_id = m.id
+      WHERE p.appointment_id = $1`,
+      [id]
+    );
+
+    res.json({
+      appointment: {
+        ...result.rows[0],
+        prescriptions: prescriptions.rows
+      }
+    });
+  } catch (error) {
+    console.error('Get appointment error:', error);
+    res.status(500).json({
+      error: 'Failed to fetch appointment',
+      message: error.message
+    });
+  }
+};
+
+// Create appointment
+export const createAppointment = async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const clinicId = req.user.clinic_id;
+    const {
+      patient_id,
+      doctor_id,
+      appointment_date,
+      appointment_time,
+      duration_minutes = 30,
+      chief_complaint
+    } = req.body;
+
+    // Check if patient exists and belongs to clinic
+    const patientCheck = await client.query(
+      'SELECT id FROM patients WHERE id = $1 AND clinic_id = $2',
+      [patient_id, clinicId]
+    );
+
+    if (patientCheck.rows.length === 0) {
+      return res.status(404).json({
+        error: 'Patient not found',
+        message: 'Patient not found or does not belong to this clinic'
+      });
+    }
+
+    // Check for conflicting appointments
+    const conflictCheck = await client.query(
+      `SELECT id FROM appointments
+       WHERE doctor_id = $1
+       AND appointment_date = $2
+       AND appointment_time = $3
+       AND status NOT IN ('cancelled', 'missed')`,
+      [doctor_id, appointment_date, appointment_time]
+    );
+
+    if (conflictCheck.rows.length > 0) {
+      return res.status(409).json({
+        error: 'Time slot not available',
+        message: 'This time slot is already booked'
+      });
+    }
+
+    // Create appointment
+    const result = await client.query(
+      `INSERT INTO appointments (
+        clinic_id, patient_id, doctor_id, appointment_date,
+        appointment_time, duration_minutes, chief_complaint, status
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 'scheduled')
+      RETURNING *`,
+      [
+        clinicId,
+        patient_id,
+        doctor_id,
+        appointment_date,
+        appointment_time,
+        duration_minutes,
+        chief_complaint
+      ]
+    );
+
+    res.status(201).json({
+      message: 'Appointment created successfully',
+      appointment: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Create appointment error:', error);
+    res.status(500).json({
+      error: 'Failed to create appointment',
+      message: error.message
+    });
+  } finally {
+    client.release();
+  }
+};
+
+// Update appointment
+export const updateAppointment = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const clinicId = req.user.clinic_id;
+    const {
+      appointment_date,
+      appointment_time,
+      status,
+      chief_complaint,
+      diagnosis,
+      treatment_notes,
+      followup_date
+    } = req.body;
+
+    const result = await pool.query(
+      `UPDATE appointments
+       SET appointment_date = COALESCE($1, appointment_date),
+           appointment_time = COALESCE($2, appointment_time),
+           status = COALESCE($3, status),
+           chief_complaint = COALESCE($4, chief_complaint),
+           diagnosis = COALESCE($5, diagnosis),
+           treatment_notes = COALESCE($6, treatment_notes),
+           followup_date = COALESCE($7, followup_date)
+       WHERE id = $8 AND clinic_id = $9
+       RETURNING *`,
+      [
+        appointment_date,
+        appointment_time,
+        status,
+        chief_complaint,
+        diagnosis,
+        treatment_notes,
+        followup_date,
+        id,
+        clinicId
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: 'Appointment not found',
+        message: 'Appointment not found or access denied'
+      });
+    }
+
+    res.json({
+      message: 'Appointment updated successfully',
+      appointment: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Update appointment error:', error);
+    res.status(500).json({
+      error: 'Failed to update appointment',
+      message: error.message
+    });
+  }
+};
+
+// Cancel appointment
+export const cancelAppointment = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const clinicId = req.user.clinic_id;
+
+    const result = await pool.query(
+      `UPDATE appointments
+       SET status = 'cancelled'
+       WHERE id = $1 AND clinic_id = $2
+       RETURNING *`,
+      [id, clinicId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: 'Appointment not found',
+        message: 'Appointment not found or access denied'
+      });
+    }
+
+    res.json({
+      message: 'Appointment cancelled successfully',
+      appointment: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Cancel appointment error:', error);
+    res.status(500).json({
+      error: 'Failed to cancel appointment',
+      message: error.message
+    });
+  }
+};
+
+// Get today's appointments
+export const getTodayAppointments = async (req, res) => {
+  try {
+    const clinicId = req.user.clinic_id;
+    const today = new Date().toISOString().split('T')[0];
+
+    const result = await pool.query(
+      `SELECT
+        a.id, a.appointment_time, a.duration_minutes, a.status,
+        a.chief_complaint,
+        p.name as patient_name, p.phone as patient_phone, p.patient_code,
+        u.name as doctor_name
+      FROM appointments a
+      LEFT JOIN patients p ON a.patient_id = p.id
+      LEFT JOIN users u ON a.doctor_id = u.id
+      WHERE a.clinic_id = $1 AND a.appointment_date = $2
+      ORDER BY a.appointment_time ASC`,
+      [clinicId, today]
+    );
+
+    res.json({
+      appointments: result.rows,
+      date: today
+    });
+  } catch (error) {
+    console.error('Get today appointments error:', error);
+    res.status(500).json({
+      error: 'Failed to fetch today\'s appointments',
+      message: error.message
+    });
+  }
+};
+
+/**
+ * Get upcoming follow-ups with patient details
+ */
+export const getUpcomingFollowups = async (req, res) => {
+  try {
+    const clinicId = req.user.clinic_id;
+    const { days = 7, status = 'all' } = req.query;
+    const today = new Date().toISOString().split('T')[0];
+
+    let query = `
+      SELECT
+        a.id as appointment_id,
+        a.followup_date,
+        a.appointment_date as last_appointment_date,
+        a.diagnosis,
+        a.treatment_notes,
+        a.chief_complaint,
+        CURRENT_DATE - a.followup_date as days_overdue,
+        p.id as patient_id,
+        p.name as patient_name,
+        p.phone as patient_phone,
+        p.email as patient_email,
+        p.patient_code,
+        p.age,
+        p.gender,
+        u.name as doctor_name
+      FROM appointments a
+      LEFT JOIN patients p ON a.patient_id = p.id
+      LEFT JOIN users u ON a.doctor_id = u.id
+      WHERE a.clinic_id = $1
+        AND a.followup_date IS NOT NULL
+        AND a.status = 'completed'
+    `;
+
+    const params = [clinicId];
+
+    if (status === 'upcoming') {
+      query += ` AND a.followup_date BETWEEN $2 AND $3`;
+      const futureDate = new Date();
+      futureDate.setDate(futureDate.getDate() + parseInt(days));
+      params.push(today, futureDate.toISOString().split('T')[0]);
+    } else if (status === 'overdue') {
+      query += ` AND a.followup_date < $2`;
+      params.push(today);
+    } else if (status === 'today') {
+      query += ` AND a.followup_date = $2`;
+      params.push(today);
+    } else {
+      // 'all' - show both upcoming and overdue
+      const futureDate = new Date();
+      futureDate.setDate(futureDate.getDate() + parseInt(days));
+      params.push(
+        new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+        futureDate.toISOString().split('T')[0]
+      );
+      query += ` AND a.followup_date BETWEEN $2 AND $3`;
+    }
+
+    query += ` ORDER BY a.followup_date ASC`;
+
+    const result = await pool.query(query, params);
+
+    res.json({
+      followups: result.rows,
+      count: result.rows.length
+    });
+  } catch (error) {
+    console.error('Get upcoming followups error:', error);
+    res.status(500).json({
+      error: 'Failed to fetch upcoming follow-ups',
+      message: error.message
+    });
+  }
+};
+
+export default {
+  getAppointments,
+  getAppointment,
+  createAppointment,
+  updateAppointment,
+  cancelAppointment,
+  getTodayAppointments,
+  getUpcomingFollowups
+};

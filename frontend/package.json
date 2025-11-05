@@ -1,0 +1,68 @@
+{
+  "name": "acms-frontend",
+  "version": "1.0.0",
+  "description": "Ayurvedic Clinic Management System - Frontend",
+  "main": "electron/main.mjs",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "eslint . --ext js,jsx --report-unused-disable-directives --max-warnings 0",
+    "electron:dev": "concurrently \"npm run dev\" \"wait-on http://localhost:5173 && node electron-launcher.cjs\"",
+    "electron:build": "npm run build && electron-builder",
+    "electron:build:win": "npm run build && electron-builder --win"
+  },
+  "build": {
+    "appId": "com.acms.desktop",
+    "productName": "ACMS",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "public/favicon.ico"
+    }
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.17.15",
+    "axios": "^1.6.5",
+    "clsx": "^2.1.1",
+    "date-fns": "^3.6.0",
+    "formik": "^2.4.5",
+    "lucide-react": "^0.307.0",
+    "react": "^18.2.0",
+    "react-big-calendar": "^1.19.4",
+    "react-dom": "^18.2.0",
+    "react-hot-toast": "^2.4.1",
+    "react-router-dom": "^6.21.1",
+    "react-to-print": "^3.2.0",
+    "tailwind-merge": "^3.3.1",
+    "yup": "^1.3.3",
+    "zustand": "^5.0.8"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.48",
+    "@types/react-dom": "^18.2.18",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.16",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "^39.1.0",
+    "electron-builder": "^26.0.12",
+    "eslint": "^8.56.0",
+    "eslint-plugin-react": "^7.33.2",
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "eslint-plugin-react-refresh": "^0.4.5",
+    "postcss": "^8.4.33",
+    "tailwindcss": "^3.4.1",
+    "vite": "^5.0.11",
+    "wait-on": "^9.0.1"
+  }
+}

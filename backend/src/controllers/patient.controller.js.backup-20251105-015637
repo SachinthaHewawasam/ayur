@@ -1,0 +1,336 @@
+import { pool } from '../config/database.js';
+
+// Get all patients for a clinic
+export const getPatients = async (req, res) => {
+  try {
+    const { search, page = 1, limit = 20 } = req.query;
+    const offset = (page - 1) * limit;
+    const clinicId = req.user.clinic_id;
+
+    let query = `
+      SELECT id, patient_code, name, phone, email, age, gender,
+             dosha_type, created_at, is_active
+      FROM patients
+      WHERE clinic_id = $1
+    `;
+    const params = [clinicId];
+
+    // Add search filter
+    if (search) {
+      query += ` AND (name ILIKE $${params.length + 1} OR phone ILIKE $${params.length + 1} OR patient_code ILIKE $${params.length + 1})`;
+      params.push(`%${search}%`);
+    }
+
+    // Add ordering and pagination
+    query += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(limit, offset);
+
+    const result = await pool.query(query, params);
+
+    // Get total count
+    let countQuery = 'SELECT COUNT(*) FROM patients WHERE clinic_id = $1';
+    const countParams = [clinicId];
+
+    if (search) {
+      countQuery += ' AND (name ILIKE $2 OR phone ILIKE $2 OR patient_code ILIKE $2)';
+      countParams.push(`%${search}%`);
+    }
+
+    const countResult = await pool.query(countQuery, countParams);
+    const total = parseInt(countResult.rows[0].count);
+
+    res.json({
+      patients: result.rows,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (error) {
+    console.error('Get patients error:', error);
+    res.status(500).json({
+      error: 'Failed to fetch patients',
+      message: error.message
+    });
+  }
+};
+
+// Get single patient by ID
+export const getPatient = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const clinicId = req.user.clinic_id;
+
+    const result = await pool.query(
+      `SELECT * FROM patients WHERE id = $1 AND clinic_id = $2`,
+      [id, clinicId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: 'Patient not found',
+        message: 'Patient not found or access denied'
+      });
+    }
+
+    res.json({
+      patient: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Get patient error:', error);
+    res.status(500).json({
+      error: 'Failed to fetch patient',
+      message: error.message
+    });
+  }
+};
+
+// Generate unique patient code
+const generatePatientCode = async (clinicId) => {
+  const result = await pool.query(
+    'SELECT COUNT(*) as count FROM patients WHERE clinic_id = $1',
+    [clinicId]
+  );
+  const count = parseInt(result.rows[0].count) + 1;
+  return `PAT${String(count).padStart(5, '0')}`;
+};
+
+// Create new patient
+export const createPatient = async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const clinicId = req.user.clinic_id;
+    const {
+      name,
+      date_of_birth,
+      age,
+      gender,
+      phone,
+      email,
+      address,
+      dosha_type,
+      allergies,
+      medical_history,
+      emergency_contact_name,
+      emergency_contact_phone
+    } = req.body;
+
+    // Check if patient with phone already exists
+    const existingPatient = await client.query(
+      'SELECT id FROM patients WHERE clinic_id = $1 AND phone = $2',
+      [clinicId, phone]
+    );
+
+    if (existingPatient.rows.length > 0) {
+      return res.status(409).json({
+        error: 'Patient already exists',
+        message: 'A patient with this phone number already exists'
+      });
+    }
+
+    // Generate patient code
+    const patientCode = await generatePatientCode(clinicId);
+
+    // Insert patient
+    const result = await client.query(
+      `INSERT INTO patients (
+        clinic_id, patient_code, name, date_of_birth, age, gender,
+        phone, email, address, dosha_type, allergies, medical_history,
+        emergency_contact_name, emergency_contact_phone
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      RETURNING *`,
+      [
+        clinicId,
+        patientCode,
+        name,
+        date_of_birth,
+        age,
+        gender,
+        phone,
+        email,
+        address,
+        dosha_type,
+        allergies,
+        medical_history,
+        emergency_contact_name,
+        emergency_contact_phone
+      ]
+    );
+
+    res.status(201).json({
+      message: 'Patient registered successfully',
+      patient: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Create patient error:', error);
+    res.status(500).json({
+      error: 'Failed to create patient',
+      message: error.message
+    });
+  } finally {
+    client.release();
+  }
+};
+
+// Update patient
+export const updatePatient = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const clinicId = req.user.clinic_id;
+    const {
+      name,
+      date_of_birth,
+      age,
+      gender,
+      phone,
+      email,
+      address,
+      dosha_type,
+      allergies,
+      medical_history,
+      emergency_contact_name,
+      emergency_contact_phone
+    } = req.body;
+
+    const result = await pool.query(
+      `UPDATE patients
+       SET name = COALESCE($1, name),
+           date_of_birth = COALESCE($2, date_of_birth),
+           age = COALESCE($3, age),
+           gender = COALESCE($4, gender),
+           phone = COALESCE($5, phone),
+           email = COALESCE($6, email),
+           address = COALESCE($7, address),
+           dosha_type = COALESCE($8, dosha_type),
+           allergies = COALESCE($9, allergies),
+           medical_history = COALESCE($10, medical_history),
+           emergency_contact_name = COALESCE($11, emergency_contact_name),
+           emergency_contact_phone = COALESCE($12, emergency_contact_phone)
+       WHERE id = $13 AND clinic_id = $14
+       RETURNING *`,
+      [
+        name,
+        date_of_birth,
+        age,
+        gender,
+        phone,
+        email,
+        address,
+        dosha_type,
+        allergies,
+        medical_history,
+        emergency_contact_name,
+        emergency_contact_phone,
+        id,
+        clinicId
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: 'Patient not found',
+        message: 'Patient not found or access denied'
+      });
+    }
+
+    res.json({
+      message: 'Patient updated successfully',
+      patient: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Update patient error:', error);
+    res.status(500).json({
+      error: 'Failed to update patient',
+      message: error.message
+    });
+  }
+};
+
+// Delete (soft delete) patient
+export const deletePatient = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const clinicId = req.user.clinic_id;
+
+    const result = await pool.query(
+      `UPDATE patients
+       SET is_active = FALSE
+       WHERE id = $1 AND clinic_id = $2
+       RETURNING id, name`,
+      [id, clinicId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        error: 'Patient not found',
+        message: 'Patient not found or access denied'
+      });
+    }
+
+    res.json({
+      message: 'Patient deactivated successfully',
+      patient: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Delete patient error:', error);
+    res.status(500).json({
+      error: 'Failed to delete patient',
+      message: error.message
+    });
+  }
+};
+
+// Get patient appointment history
+export const getPatientHistory = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const clinicId = req.user.clinic_id;
+
+    // Get appointments with prescriptions
+    const result = await pool.query(
+      `SELECT
+        a.id, a.appointment_date, a.appointment_time, a.status,
+        a.chief_complaint, a.diagnosis, a.treatment_notes, a.followup_date,
+        u.name as doctor_name,
+        json_agg(
+          json_build_object(
+            'medicine', m.name,
+            'dosage', p.dosage,
+            'frequency', p.frequency,
+            'duration_days', p.duration_days
+          )
+        ) FILTER (WHERE p.id IS NOT NULL) as prescriptions
+      FROM appointments a
+      LEFT JOIN users u ON a.doctor_id = u.id
+      LEFT JOIN prescriptions p ON a.id = p.appointment_id
+      LEFT JOIN medicines m ON p.medicine_id = m.id
+      WHERE a.patient_id = $1 AND a.clinic_id = $2
+      GROUP BY a.id, u.name
+      ORDER BY a.appointment_date DESC, a.appointment_time DESC`,
+      [id, clinicId]
+    );
+
+    res.json({
+      history: result.rows
+    });
+  } catch (error) {
+    console.error('Get patient history error:', error);
+    res.status(500).json({
+      error: 'Failed to fetch patient history',
+      message: error.message
+    });
+  }
+};
+
+export default {
+  getPatients,
+  getPatient,
+  createPatient,
+  updatePatient,
+  deletePatient,
+  getPatientHistory
+};
