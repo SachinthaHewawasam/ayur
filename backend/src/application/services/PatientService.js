@@ -144,9 +144,10 @@ export class PatientService {
    * Generate unique patient code
    */
   async generatePatientCode(clinicId) {
-    const count = await this.patientRepo.countByClinic(clinicId, {});
-    const paddedNumber = String(count + 1).padStart(5, '0');
-    return `PAT${paddedNumber}`;
+    // Use timestamp + random number to ensure uniqueness
+    const timestamp = Date.now().toString().slice(-6);
+    const random = Math.floor(Math.random() * 1000).toString().padStart(3, '0');
+    return `PAT${timestamp}${random}`;
   }
   
   /**
